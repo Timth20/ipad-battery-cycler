@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="robots" content="noindex,nofollow">
+<title>耗电机</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; overflow: hidden;
+    font: 15px/1.45 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; color: #111;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  #stage { position: fixed; inset: 0; }
+  #stage canvas { width: 100%; height: 100%; display: block; }
+  #panel { position: fixed; left: 16px; top: 16px; width: min(440px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px); overflow: auto; -webkit-overflow-scrolling: touch;
+    background: rgba(255,255,255,.9); border-radius: 14px; padding: 14px 16px; box-sizing: border-box;
+    box-shadow: 0 2px 18px rgba(0,0,0,.25); transition: transform 2s; }
+  h1 { font-size: 17px; margin: 0 0 6px; display: flex; align-items: center; gap: 8px; }
+  #dot { width: 12px; height: 12px; border-radius: 50%; background: #999; flex: none; }
+  #dot.on { background: #e5342b; animation: pulse 1s infinite alternate; }
+  #dot.wait { background: #e8a200; }
+  @keyframes pulse { from { opacity: 1; } to { opacity: .35; } }
+  #state { font-size: 20px; font-weight: 700; margin: 2px 0 8px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0;
+    font-variant-numeric: tabular-nums; }
+  .row span:first-child { color: #555; flex: none; }
+  .row span:last-child { text-align: right; }
+  button { font: inherit; border: 0; border-radius: 10px; padding: 10px 14px; margin: 8px 8px 0 0;
+    background: #e9e9ee; color: #111; }
+  button.big { background: #e5342b; color: #fff; font-weight: 700; font-size: 17px; padding: 14px 22px; }
+  h2 { font-size: 14px; margin: 14px 0 4px; color: #333; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 3px 4px; border-top: 1px solid #ddd; white-space: nowrap; }
+  th { color: #555; font-weight: 500; border-top: 0; }
+  #hint { color: #555; font-size: 13px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="panel">
+  <h1><i id="dot"></i>耗电机</h1>
+  <div id="state">加载中…</div>
+  <div class="row"><span>现在时间</span><span id="clock">–</span></div>
+  <div class="row"><span>本段已运行</span><span id="seg">–</span></div>
+  <div class="row"><span>GPU</span><span id="gpu">–</span></div>
+  <div class="row"><span>CPU</span><span id="cpu">–</span></div>
+  <div class="row"><span>今日 / 累计</span><span id="sum">–</span></div>
+  <div>
+    <button id="btnStart" class="big" hidden>开始（这台设备以后自动开始）</button>
+    <button id="btnStop" hidden>停止并取消自动开始</button>
+  </div>
+  <div id="hint"></div>
+  <h2>运行记录（每段 = 一次放电）</h2>
+  <table>
+    <thead><tr><th>开始</th><th>结束</th><th>时长</th><th>结束原因</th></tr></thead>
+    <tbody id="log"></tbody>
+  </table>
+  <div>
+    <button id="btnCopy">复制全部记录</button>
+    <button id="btnClear">清空记录</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* =========================================================================
+   耗电机：页面在前台就把 GPU + CPU 压满；进后台就停；回前台 / 重新加载自动继续。
+   不读电量、不发任何网络请求、不含任何 token。
+   ========================================================================= */
+
+const $ = id => document.getElementById(id);
+const K_ARMED = 'bb.armed', K_LOG = 'bb.log', K_RELOAD = 'bb.lastReload';
+const LOG_MAX = 400;
+
+/* ---------- 存储（全部 try/catch：无痕模式等情况下页面照常工作） ---------- */
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  del(k) { try { localStorage.removeItem(k); } catch (e) {} },
+};
+function readLog() {
+  try { const a = JSON.parse(store.get(K_LOG) || '[]'); return Array.isArray(a) ? a : []; }
+  catch (e) { return []; }
+}
+// 每次都重新读再写：允许多个标签页共用同一份记录而不互相覆盖
+function mutateLog(fn) {
+  const a = readLog(); fn(a);
+  while (a.length > LOG_MAX) a.shift();
+  store.set(K_LOG, JSON.stringify(a));
+  return a;
+}
+
+// 给没正常收尾的段（页面被回收 / 重载 / 崩溃）补上结束时间 = 最后一次心跳；
+// 连一次心跳都没来得及打的（不到 10 秒）直接丢掉，免得记录里全是 0 秒的噪音
+function sealOrphans(a) {
+  for (let i = a.length - 1; i >= 0; i--) {
+    const s = a[i];
+    if (s.e != null) continue;
+    if ((s.hb || s.s) - s.s < 5000) a.splice(i, 1);
+    else { s.e = s.hb; s.r = '中断（页面被回收或重载）'; }
+  }
+}
+
+/* ---------- 运行状态 ---------- */
+// 两种「已启用」的来源：
+//  1) 这台设备上点过「开始」（记在 localStorage 里）
+//  2) 网址带 ?auto=1 或 #auto —— 给 iPad 的快捷指令用。Safari 会清掉 7 天没人点过的网站的
+//     localStorage，无人值守时只靠 1) 会在一周后失效，所以自动化里要用带 auto 的网址。
+const urlAuto = /[?&#]auto(=1)?(&|#|$)/.test(location.search + location.hash);
+let armed = urlAuto || store.get(K_ARMED) === '1';
+let running = false;
+let curId = null, segStart = 0, hbTimer = 0;
+
+function openSegment() {
+  const now = Date.now();
+  curId = now + '-' + Math.random().toString(36).slice(2, 7);
+  segStart = now;
+  mutateLog(a => {
+    sealOrphans(a);
+    a.push({ id: curId, s: now, hb: now, e: null, r: '' });
+  });
+  hbTimer = setInterval(() => {
+    const id = curId, t = Date.now();
+    mutateLog(a => { const s = a.find(x => x.id === id); if (s && s.e == null) s.hb = t; });
+  }, 10000);
+}
+function closeSegment(reason) {
+  clearInterval(hbTimer);
+  const id = curId, t = Date.now(); curId = null;
+  if (!id) return;
+  mutateLog(a => { const s = a.find(x => x.id === id); if (s && s.e == null) { s.e = t; s.hb = t; s.r = reason; } });
+}
+
+function start() {
+  if (running) return;
+  running = true;
+  openSegment();
+  cpu.start();
+  gpu.start();
+  wakeLock(true);
+  render();
+}
+function stop(reason) {
+  if (!running) return;
+  running = false;
+  cpu.stop();
+  gpu.stop();
+  wakeLock(false);
+  closeSegment(reason);
+  render();
+}
+function visible() { return document.visibilityState === 'visible'; }
+function reconcile(reason) {
+  if (armed && visible()) start(); else stop(reason || '进入后台');
+}
+
+document.addEventListener('visibilitychange', () => reconcile('进入后台'));
+window.addEventListener('pageshow', () => reconcile('进入后台'));
+window.addEventListener('pagehide', () => stop('进入后台'));
+document.addEventListener('freeze', () => stop('进入后台'));
+document.addEventListener('resume', () => reconcile('进入后台'));
+
+/* 屏幕常亮：能拿到就拿，拿不到无所谓（真正靠的是「自动锁定：永不」） */
+let wl = null;
+function wakeLock(on) {
+  try {
+    if (on && navigator.wakeLock && !wl) {
+      navigator.wakeLock.request('screen').then(l => {
+        wl = l; l.addEventListener('release', () => { wl = null; });
+        if (!running) { l.release().catch(() => {}); }
+      }).catch(() => {});
+    } else if (!on && wl) { wl.release().catch(() => {}); wl = null; }
+  } catch (e) {}
+}
+
+/* =========================================================================
+   CPU：一组 Web Worker 做浮点 + 整数 + 内存读写。每 40ms 让出一次，保证能收到停止消息。
+   ========================================================================= */
+const cpu = (() => {
+  const src = `
+    let run = false, ops = 0, x = (Math.random() * 4294967296) >>> 0 || 88172645;
+    const N = 1 << 18, a = new Float64Array(N), u = new Uint32Array(N);
+    function chunk() {
+      const end = performance.now() + 40;
+      do {
+        for (let i = 0; i < 20000; i++) {
+          x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+          const j = (x >>> 0) & (N - 1);
+          a[j] = Math.sqrt(a[j] + (x >>> 0) * 1e-9) + Math.sin(i * 0.001) * Math.cos(a[(j + 1) & (N - 1)]);
+          u[j] = (Math.imul(u[j], 1664525) + 1013904223) >>> 0;
+        }
+        ops += 20000;
+      } while (performance.now() < end);
+    }
+    function loop() { if (!run) return; chunk(); setTimeout(loop, 0); }
+    onmessage = e => {
+      if (e.data === 'start' && !run) { run = true; loop(); }
+      if (e.data === 'stop') run = false;
+    };
+    setInterval(() => { postMessage(ops); ops = 0; }, 1000);
+  `;
+  let url = null, workers = [], rate = 0, acc = 0, peak = 0, rateTimer = 0;
+  // Safari 可能少报核心数；多开几个线程无害（系统会分时），所以至少开 10 个
+  const count = Math.min(16, Math.max(navigator.hardwareConcurrency || 0, 10));
+  return {
+    count,
+    start() {
+      if (workers.length) return;
+      try {
+        url = url || URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        for (let i = 0; i < count; i++) {
+          const w = new Worker(url);
+          w.onmessage = e => { acc += e.data; };
+          w.onerror = () => {};
+          w.postMessage('start');
+          workers.push(w);
+        }
+      } catch (e) { this.err = String(e); }
+      rateTimer = setInterval(() => { rate = acc; acc = 0; if (rate > peak) peak = rate; }, 1000);
+    },
+    stop() {
+      for (const w of workers) { try { w.terminate(); } catch (e) {} }
+      workers = []; clearInterval(rateTimer); rate = 0; acc = 0;
+    },
+    status() {
+      if (this.err) return '启动失败：' + this.err;
+      if (!workers.length) return '已停';
+      const pct = peak ? Math.round(rate / peak * 100) : 0;
+      return workers.length + ' 线程 · ' + (rate / 1e6).toFixed(0) + ' M/s（峰值的 ' + pct + '%）';
+    },
+  };
+})();
+
+/* =========================================================================
+   GPU：WebGL2 分形着色器，离屏多层混合绘制（开混合是为了不让 Apple GPU 的
+   隐藏面消除把重复的层优化掉）。用 fenceSync 测「这一批 GPU 实际算了多久」，
+   算完立刻提交下一批 → GPU 始终有活干，但主线程不被阻塞、命令也不会堆积。
+   自动调节：每批耗时向 TARGET_MS 靠拢；丢上下文后降档并自动重建。
+   ========================================================================= */
+const gpu = (() => {
+  const TARGET_MS = 50;         // 每批 GPU 工作量的目标耗时
+  const STALL_MS = 4000;        // 一批超过这么久没完成 → 视为卡住
+  const SIZE = 1024;            // 离屏纹理边长
+  const PASS_MAX = 36, ITER_MIN = 32, ITER_MAX = 512;
+  const LOAD_MAX = PASS_MAX * ITER_MAX / 64;   // load 的单位：「64 次迭代的整屏层数」
+
+  const VS = `#version 300 es
+    in vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }`;
+  const FS_HEAVY = `#version 300 es
+    precision highp float;
+    uniform float uT, uSeed, uSize; uniform int uIter;
+    out vec4 o;
+    void main(){
+      vec2 uv = (gl_FragCoord.xy / uSize - 0.5) * 2.0;
+      float a = uT * 0.05 + uSeed * 1.7;
+      uv = mat2(cos(a), -sin(a), sin(a), cos(a)) * uv;
+      vec3 p = vec3(uv * (0.8 + 0.2 * sin(uT * 0.11 + uSeed)), 0.4 + 0.25 * sin(uT * 0.07 + uSeed));
+      vec3 c = vec3(0.62 + 0.08 * sin(uT * 0.031), 0.55 + 0.07 * cos(uT * 0.043), 0.90 + 0.10 * sin(uT * 0.023 + uSeed));
+      float acc = 0.0, prev = 0.0;
+      for (int i = 0; i < ${ITER_MAX}; i++) {
+        if (i >= uIter) break;
+        p = abs(p) / max(dot(p, p), 1e-6) - c;
+        float l = length(p);
+        acc += abs(l - prev); prev = l;
+      }
+      float v = acc / float(uIter);
+      vec3 col = 0.5 + 0.5 * cos(6.2831853 * (v * 0.35 + vec3(0.0, 0.33, 0.67)) + uT * 0.2 + uSeed);
+      col = mix(col, vec3(1.0), 0.35);            // 偏亮：OLED 屏上更耗电
+      o = vec4(col, 0.35);
+    }`;
+  const FS_BLIT = `#version 300 es
+    precision mediump float;
+    uniform sampler2D uTex; uniform vec2 uRes;
+    out vec4 o;
+    void main(){ o = vec4(texture(uTex, gl_FragCoord.xy / uRes).rgb, 1.0); }`;
+
+  let canvas = null, gl = null, lost = false, on = false, unsupported = false;
+  let heavy, blit, U = {}, fbo, tex, vao;
+  let load = 0.25, iter = 64, loadCap = LOAD_MAX, capUntil = 0, lastLossAt = 0;
+  let sync = null, tSubmit = 0, lastMs = 0, emaMs = 0, t0 = performance.now();
+  let losses = 0, stalls = 0, rebuilds = 0, timer = 0, restoreTimer = 0, batches = 0;
+
+  function makeCanvas() {
+    if (canvas) canvas.remove();
+    canvas = document.createElement('canvas');
+    const s = Math.min(1, 1280 / Math.max(innerWidth, innerHeight, 1));
+    canvas.width = Math.max(64, Math.round(innerWidth * s));
+    canvas.height = Math.max(64, Math.round(innerHeight * s));
+    canvas.addEventListener('webglcontextlost', e => {
+      e.preventDefault();
+      lost = true; losses++; sync = null;
+      // 降档：负载上限压到出事时的 60%，保持 10 分钟；半小时内又丢一次就保持 1 小时
+      const nowMs = Date.now(), again = nowMs - lastLossAt < 1800000;
+      lastLossAt = nowMs;
+      loadCap = Math.max(0.3, load * 0.6); capUntil = nowMs + (again ? 3600000 : 600000);
+      clearTimeout(restoreTimer);
+      restoreTimer = setTimeout(rebuild, 5000);   // 5 秒内系统没自动恢复 → 自己重建
+    });
+    canvas.addEventListener('webglcontextrestored', () => { clearTimeout(restoreTimer); init(); });
+    $('stage').appendChild(canvas);
+  }
+
+  function compile(type, srcText) {
+    const s = gl.createShader(type); gl.shaderSource(s, srcText); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS) && !gl.isContextLost())
+      throw new Error(gl.getShaderInfoLog(s) || 'shader');
+    return s;
+  }
+  function program(fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, VS));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, 'p'); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS) && !gl.isContextLost())
+      throw new Error(gl.getProgramInfoLog(p) || 'link');
+    return p;
+  }
+
+  function init() {
+    try {
+      gl = canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false,
+        powerPreference: 'high-performance', preserveDrawingBuffer: false });
+      if (!gl) { unsupported = true; return false; }
+      unsupported = false;
+      heavy = program(FS_HEAVY); blit = program(FS_BLIT);
+      U = { t: gl.getUniformLocation(heavy, 'uT'), seed: gl.getUniformLocation(heavy, 'uSeed'),
+            size: gl.getUniformLocation(heavy, 'uSize'), iter: gl.getUniformLocation(heavy, 'uIter'),
+            tex: gl.getUniformLocation(blit, 'uTex'), res: gl.getUniformLocation(blit, 'uRes') };
+      vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+      const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, SIZE, SIZE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      gl.clearColor(1, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.disable(gl.DEPTH_TEST);
+      lost = false; sync = null; emaMs = 0;
+      load = Math.min(load, 0.25);     // 每次（重新）初始化都从很轻的负载慢慢爬升
+      return true;
+    } catch (e) {
+      console.warn('GL init failed', e);
+      gl = null; return false;
+    }
+  }
+
+  function rebuild() {
+    clearTimeout(restoreTimer);
+    if (!on) return;
+    rebuilds++;
+    makeCanvas();
+    if (!init() && !unsupported) {
+      if (rebuilds >= 6) hardReload(); else restoreTimer = setTimeout(rebuild, 10000);
+    }
+  }
+  // 最后手段：整页重载（2 分钟内最多一次，避免死循环）
+  function hardReload() {
+    const last = +(store.get(K_RELOAD) || 0);
+    if (Date.now() - last < 120000) { restoreTimer = setTimeout(rebuild, 30000); rebuilds = 0; return; }
+    store.set(K_RELOAD, String(Date.now()));
+    location.reload();
+  }
+
+  function submit() {
+    const t = (performance.now() - t0) / 1000;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.viewport(0, 0, SIZE, SIZE);
+    gl.useProgram(heavy); gl.bindVertexArray(vao);
+    // 把 load 拆成「迭代次数 × 层数」，让层数保持在 1~PASS_MAX 之间（单次 draw 开销适中）
+    let n = load; iter = 64;
+    while (n > PASS_MAX && iter < ITER_MAX) { iter *= 2; n /= 2; }
+    while (n < 1 && iter > ITER_MIN) { iter /= 2; n *= 2; }
+    gl.uniform1f(U.t, t); gl.uniform1f(U.size, SIZE); gl.uniform1i(U.iter, iter);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    const full = Math.floor(n), frac = n - full;
+    for (let i = 0; i < full; i++) { gl.uniform1f(U.seed, i * 0.37); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+    if (frac > 0.01) {                              // 小数部分：只画一部分高度
+      gl.enable(gl.SCISSOR_TEST); gl.scissor(0, 0, SIZE, Math.max(1, Math.round(SIZE * frac)));
+      gl.uniform1f(U.seed, full * 0.37); gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.disable(gl.SCISSOR_TEST);
+    }
+    gl.disable(gl.BLEND);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(blit); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(U.tex, 0); gl.uniform2f(U.res, canvas.width, canvas.height);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    tSubmit = performance.now();
+    batches++;
+  }
+
+  function adjust(ms) {
+    lastMs = ms; emaMs = emaMs ? emaMs * 0.8 + ms * 0.2 : ms;
+    if (capUntil && Date.now() > capUntil) { capUntil = 0; loadCap = LOAD_MAX; }
+    let k = TARGET_MS / Math.max(ms, 1);
+    k = Math.min(1.25, Math.max(0.5, k));
+    load *= 1 + (k - 1) * 0.5;
+    load = Math.min(loadCap, Math.max(0.03, load));
+  }
+
+  function tick() {
+    if (!on) return;
+    timer = setTimeout(tick, 4);
+    if (!gl || lost) return;
+    try {
+      if (gl.isContextLost()) return;
+      const now = performance.now();
+      if (sync) {
+        const st = gl.clientWaitSync(sync, 0, 0);
+        if (st === gl.TIMEOUT_EXPIRED) {
+          if (now - tSubmit < STALL_MS) return;
+          // 卡住了：大幅降档；连续卡住就重建上下文
+          stalls++; load = Math.max(0.03, load * 0.4); emaMs = 0;
+          gl.deleteSync(sync); sync = null;
+          if (stalls % 3 === 0) { rebuild(); return; }
+        } else {
+          gl.deleteSync(sync); sync = null;
+          adjust(now - tSubmit);
+        }
+      }
+      submit();
+    } catch (e) {
+      console.warn('GL tick failed', e);
+      sync = null; lost = true;
+      clearTimeout(restoreTimer); restoreTimer = setTimeout(rebuild, 3000);
+    }
+  }
+
+  return {
+    start() {
+      if (on) return;
+      on = true; rebuilds = 0;
+      if (!canvas || !gl || lost) { makeCanvas(); init(); }
+      sync = null; emaMs = 0;
+      load = Math.min(load, 0.25);
+      tick();
+    },
+    stop() {
+      on = false; clearTimeout(timer); clearTimeout(restoreTimer);
+      if (gl && sync) { try { gl.deleteSync(sync); } catch (e) {} }
+      sync = null;
+    },
+    status() {
+      if (unsupported) return '此浏览器不支持 WebGL2（只跑 CPU）';
+      if (!on) return '已停';
+      if (lost || !gl) return '上下文丢失，恢复中…（累计 ' + losses + ' 次）';
+      return load.toFixed(1) + ' 层 · ' + Math.round(emaMs || lastMs) + ' ms/批'
+        + (losses || stalls ? ' · 丢失 ' + losses + ' 卡顿 ' + stalls : '');
+    },
+    // 调试 / 测试用
+    _debug() { return { on, lost, load, iter, emaMs, losses, stalls, rebuilds, batches, hasGl: !!gl }; },
+    _lose() { const x = gl && gl.getExtension('WEBGL_lose_context'); if (x) x.loseContext(); return !!x; },
+  };
+})();
+window.__bb = { gpu, cpu, state: () => ({ armed, running }) };
+
+/* =========================================================================
+   界面
+   ========================================================================= */
+const p2 = n => String(n).padStart(2, '0');
+function fmtT(ms) { const d = new Date(ms); return p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()); }
+function fmtD(ms) {
+  const s = Math.max(0, Math.round(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+  return h ? h + ' 小时 ' + p2(m) + ' 分' : m ? m + ' 分 ' + p2(s % 60) + ' 秒' : s + ' 秒';
+}
+
+function render() {
+  const now = Date.now();
+  $('clock').textContent = fmtT(now) + ':' + p2(new Date(now).getSeconds());
+  const st = $('state'), dot = $('dot');
+  if (!armed) { st.textContent = '未启用：请点一次「开始」'; dot.className = ''; }
+  else if (running) { st.textContent = '运行中 · 全速耗电'; dot.className = 'on'; }
+  else { st.textContent = '已暂停（页面不在前台）'; dot.className = 'wait'; }
+  $('btnStart').hidden = armed; $('btnStop').hidden = !armed;
+  $('hint').textContent = armed
+    ? '已启用：页面在前台就自动满载，进后台自动停。' + (urlAuto ? '（网址带 auto，每次打开都会自动开始）' : '')
+    : (urlAuto ? '已手动停止。这个网址带 auto，重新打开会再次自动开始。'
+               : '每台设备第一次需要手动点「开始」，之后打开页面会自动开始。');
+  $('seg').textContent = running ? fmtD(now - segStart) : '–';
+  $('gpu').textContent = gpu.status();
+  $('cpu').textContent = cpu.status();
+}
+
+function renderLog() {
+  const a = readLog(), now = Date.now();
+  const day0 = new Date(); day0.setHours(0, 0, 0, 0);
+  let total = 0, today = 0, todayN = 0;
+  for (const s of a) {
+    const end = s.e != null ? s.e : (s.id === curId ? now : (s.hb || s.s)), d = Math.max(0, end - s.s);
+    total += d;
+    if (end >= day0.getTime()) { todayN++; today += Math.max(0, end - Math.max(s.s, day0.getTime())); }
+  }
+  $('sum').textContent = todayN + ' 段 ' + fmtD(today) + ' / ' + a.length + ' 段 ' + fmtD(total);
+  const rows = a.slice(-40).reverse().map(s => {
+    const live = s.e == null && s.id === curId;
+    const end = s.e != null ? s.e : (live ? now : (s.hb || s.s));
+    return '<tr><td>' + fmtT(s.s) + '</td><td>' + (live ? '进行中' : fmtT(end)) + '</td><td>' + fmtD(end - s.s)
+      + '</td><td>' + (live ? '' : (s.r || '中断')) + '</td></tr>';
+  });
+  $('log').innerHTML = rows.join('') || '<tr><td colspan="4">还没有记录</td></tr>';
+}
+
+function logText() {
+  return readLog().map(s => {
+    const end = s.e != null ? s.e : (s.hb || s.s);
+    const f = t => new Date(t).getFullYear() + '-' + fmtT(t);
+    return f(s.s) + '\t' + f(end) + '\t' + Math.round((end - s.s) / 60000) + ' 分钟\t' + (s.e != null ? s.r : '进行中');
+  }).join('\n');
+}
+
+$('btnStart').onclick = () => { armed = true; store.set(K_ARMED, '1'); reconcile(); render(); };
+$('btnStop').onclick = () => { armed = false; store.del(K_ARMED); stop('手动停止'); render(); renderLog(); };
+$('btnClear').onclick = () => {
+  if (!confirm('清空全部运行记录？')) return;
+  mutateLog(a => { const keep = a.filter(s => s.id === curId); a.length = 0; a.push(...keep); });
+  renderLog();
+};
+$('btnCopy').onclick = async () => {
+  const t = logText() || '（无记录）';
+  try { await navigator.clipboard.writeText(t); $('btnCopy').textContent = '已复制'; }
+  catch (e) { prompt('长按全选后复制：', t); }
+  setTimeout(() => { $('btnCopy').textContent = '复制全部记录'; }, 1500);
+};
+
+setInterval(render, 1000);
+setInterval(renderLog, 5000);
+// 面板每分钟挪一点位置，减轻长时间静态画面的烧屏风险
+setInterval(() => {
+  const x = Math.round(Math.random() * 60), y = Math.round(Math.random() * 60);
+  $('panel').style.transform = 'translate(' + x + 'px,' + y + 'px)';
+}, 60000);
+
+// 上次没正常收尾的段先补上结束时间，然后按当前状态决定是否开跑
+mutateLog(sealOrphans);
+reconcile();
+render(); renderLog();
+</script>
+</body>
+</html>
